@@ -353,3 +353,364 @@
   customers with both powerful capabilities and the controls needed to manage costs effectively.
 
   For most queries, users likely get basic search. Agent workflows are probably reserved for complex scenarios where the additional cost is justified by the quality improvement.
+
+
+## Q: How to best run Onyx on a single cloud box, maybe in a container???
+
+## A: Based on my analysis of the Onyx codebase, here's the best configuration for running Onyx locally on a single cloud box:
+
+  Container Architecture
+
+  Yes, Onyx requires multiple containers. From scripts/restart_containers.sh:6-7,23-24, the core dependencies are:
+
+  Required Containers:
+
+  1. PostgreSQL (onyx_postgres) - Database on port 5432
+  2. Vespa (onyx_vespa) - Search engine on ports 8081, 19071
+  3. Redis (onyx_redis) - Cache/job queue on port 6379
+  4. MinIO (onyx_minio) - Object storage on ports 9004/9005
+  5. Onyx Backend - Main API server on port 8080
+  6. Model Server - ML inference server on port 9000
+  7. Web Frontend - UI on port 3000
+  8. Background Workers - Multiple Celery workers for document processing
+
+  Deployment Options
+
+  Option 1: Docker Compose (Recommended)
+
+  From deployment/docker_compose/docker-compose.dev.yml:1-100:
+
+  # GPU-enabled (recommended if available)
+  cd /path/to/onyx/deployment/docker_compose
+  docker compose -f docker-compose.gpu-dev.yml -p onyx-stack up -d --pull always --force-recreate
+
+  # CPU-only fallback
+  docker compose -f docker-compose.dev.yml -p onyx-stack up -d --pull always --force-recreate
+
+  Option 2: Manual Container Setup
+
+  The scripts/restart_containers.sh script shows the minimal container setup:
+
+  # PostgreSQL
+  docker run -p 5432:5432 --name onyx_postgres -e POSTGRES_PASSWORD=password -d postgres -c max_connections=250
+
+  # Vespa (search engine)
+  docker run --detach --name onyx_vespa --hostname vespa-container --publish 8081:8081 --publish 19071:19071 vespaengine/vespa:8
+
+  # Redis (cache)
+  docker run --detach --name onyx_redis --publish 6379:6379 redis
+
+  # MinIO (object storage)
+  docker run --detach --name onyx_minio --publish 9004:9000 --publish 9005:9001 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data --console-address ":9001"
+
+  Minimum Hardware Requirements
+
+  For Development/Testing:
+
+  - CPU: 4-6 cores minimum (8+ recommended)
+  - RAM: 16GB minimum (32GB recommended)
+  - Storage: 100GB SSD minimum (500GB+ for production data)
+  - Network: Good internet for initial model downloads (~15+ minutes)
+
+  For Production/Heavy Usage:
+
+  - CPU: 8-16 cores (the supervisord.conf shows 8+ Celery worker processes)
+  - RAM: 32-64GB
+  - Storage: 1TB+ SSD
+  - GPU: Highly recommended - 8GB+ VRAM (e.g., RTX 4070, A4000)
+
+  GPU Considerations (deployment/docker_compose/README.md:11-14):
+
+  - VRAM Usage: ~1GB per embedding model (2GB total for inference + indexing)
+  - Supported: NVIDIA GPUs with proper driver setup
+  - Performance: "Significant improvements" according to docs
+  - Requirements: NVIDIA drivers + nvidia-container-toolkit
+
+  Cloud Instance Recommendations
+
+  AWS:
+
+  - Development: c5.2xlarge (8 vCPU, 16GB RAM) + 100GB EBS
+  - Production: c5.4xlarge (16 vCPU, 32GB RAM) + p3.2xlarge (GPU) + 500GB EBS
+  - Cost: ~$200-800/month depending on usage
+
+  Google Cloud:
+
+  - Development: n2-standard-8 (8 vCPU, 32GB RAM)
+  - Production: n2-standard-16 + T4/V100 GPU
+  - Cost: ~$180-600/month
+
+  Azure:
+
+  - Development: Standard_D8s_v3 (8 vCPU, 32GB RAM)
+  - Production: Standard_NC6s_v3 (GPU-enabled)
+
+  Step-by-Step Setup
+
+  1. Provision Cloud Instance
+    - Choose GPU-enabled if budget allows
+    - Install Docker + Docker Compose
+    - For GPU: Install NVIDIA drivers + container toolkit
+  2. Clone & Deploy
+  git clone https://github.com/onyx-dot-app/onyx.git
+  cd onyx/deployment/docker_compose
+
+  # Copy environment template
+  cp env.prod.template .env
+  # Edit .env with your settings (API keys, etc.)
+
+  # Launch with GPU
+  docker compose -f docker-compose.gpu-dev.yml -p onyx-stack up -d --pull always
+
+  # Or CPU-only
+  docker compose -f docker-compose.dev.yml -p onyx-stack up -d --pull always
+  3. Initial Setup
+    - Wait 15+ minutes for downloads/startup
+    - Access web UI at http://your-ip:3000
+    - API available at http://your-ip:8080
+
+  Performance Notes
+
+  - Cold start: Expect 15-30 minutes initial setup time
+  - Document indexing: CPU-intensive, benefits from more cores
+  - Search queries: GPU acceleration provides significant speedup
+  - Memory usage: Scales with document corpus size and concurrent users
+  - Agent queries: Much more resource-intensive than basic search (5-10x)
+
+  The Docker Compose approach is definitely recommended as it handles all the service orchestration and networking automatically. Manual container setup is more complex but gives you finer control over resource
+  allocation.
+
+
+## Q: How to integrate MCP servers into Onyx?
+
+## A: Based on my analysis of the Onyx codebase, I can see that Onyx does NOT have native MCP (Model Context Protocol) server integration. However, it has a robust Custom Tool system that can be used to integrate external APIs and services, including your EDGAR filings MCP server.
+
+  Here's how to integrate your EDGAR filings MCP server into Onyx:
+
+  Option 1: Custom Tool Integration (Recommended)
+
+  Onyx supports custom tools via OpenAPI specifications (onyx/tools/tool_implementations/custom/custom_tool.py:77-100). You'll need to:
+
+  Step 1: Create OpenAPI Wrapper for Your MCP Server
+
+  Since MCP uses JSON-RPC, you'll need to create an HTTP API wrapper around your MCP server:
+
+```
+  # edgar_api_wrapper.py
+  from fastapi import FastAPI, HTTPException
+  from pydantic import BaseModel
+  import asyncio
+  from mcp import ClientSession, StdioServerParameters
+  import json
+
+  app = FastAPI(title="EDGAR MCP API", version="1.0.0")
+
+  class SearchRequest(BaseModel):
+      query: str
+      limit: int = 10
+
+  class FilingRequest(BaseModel):
+      cik: str
+      form_type: str = None
+
+  @app.post("/search", 
+            summary="Search EDGAR filings",
+            description="Search through SEC EDGAR database for company filings")
+  async def search_filings(request: SearchRequest):
+      # Connect to your MCP server and make the search call
+      # Return structured data that Onyx can use
+      pass
+
+  @app.get("/filing/{cik}",
+           summary="Get filing by CIK",
+           description="Retrieve specific filing by Company Central Index Key")
+  async def get_filing(cik: str, form_type: str = None):
+      # Connect to your MCP server
+      pass
+```
+
+  Step 2: Generate OpenAPI Schema
+
+```
+  # Generate OpenAPI schema from your FastAPI app
+  python -c "
+  import json
+  from edgar_api_wrapper import app
+  print(json.dumps(app.openapi(), indent=2))
+  " > edgar_openapi.json
+```
+
+  Step 3: Register Custom Tool in Onyx
+
+  Using the admin API (onyx/server/features/tool/api.py:54-71):
+
+```
+  # Register the custom tool via API
+  curl -X POST "http://your-onyx-instance:8080/admin/tool/custom" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "edgar_search",
+      "description": "Search SEC EDGAR database for company filings and financial data",
+      "definition": '$(cat edgar_openapi.json)',
+      "custom_headers": [
+        {
+          "key": "Authorization",
+          "value": "Bearer YOUR_API_KEY"
+        }
+      ],
+      "passthrough_auth": false
+    }'
+```
+
+  Step 4: Add to Persona
+
+  In the Onyx web UI:
+  1. Go to Assistants → Create/Edit Assistant
+  2. In the Tools section, enable your "EDGAR Search" tool
+  3. Configure the assistant with appropriate prompts for financial/legal queries
+
+  Option 2: Direct Integration as Built-in Tool
+
+  For deeper integration, you can add it as a built-in tool (onyx/tools/built_in_tools.py:38-83):
+
+  Step 1: Create EDGAR Tool Class
+
+```
+  # onyx/tools/tool_implementations/edgar/edgar_tool.py
+  from collections.abc import Generator
+  from typing import Any
+
+  from onyx.tools.tool import Tool
+  from onyx.tools.models import ToolResponse
+
+  class EdgarTool(Tool):
+      _NAME = "edgar_search"
+      _DISPLAY_NAME = "EDGAR Search"
+      _DESCRIPTION = "Search SEC EDGAR database for company filings"
+
+      def __init__(self, mcp_server_endpoint: str):
+          self.mcp_endpoint = mcp_server_endpoint
+
+      @property
+      def name(self) -> str:
+          return self._NAME
+
+      @property
+      def description(self) -> str:
+          return self._DESCRIPTION
+
+      @property
+      def display_name(self) -> str:
+          return self._DISPLAY_NAME
+
+      def tool_definition(self) -> dict:
+          return {
+              "type": "function",
+              "function": {
+                  "name": self._NAME,
+                  "description": self._DESCRIPTION,
+                  "parameters": {
+                      "type": "object",
+                      "properties": {
+                          "query": {
+                              "type": "string",
+                              "description": "Search query for EDGAR filings"
+                          },
+                          "cik": {
+                              "type": "string",
+                              "description": "Company CIK number (optional)"
+                          }
+                      },
+                      "required": ["query"]
+                  }
+              }
+          }
+
+      def run(self, **kwargs: Any) -> Generator[ToolResponse, None, None]:
+          # Connect to your MCP server and execute the query
+          # Return formatted results
+          pass
+```
+
+  Step 2: Register in Built-in Tools
+
+  Add to onyx/tools/built_in_tools.py:38-83:
+
+  from onyx.tools.tool_implementations.edgar.edgar_tool import EdgarTool
+
+```
+  BUILT_IN_TOOLS: list[InCodeToolInfo] = [
+      # ... existing tools ...
+      InCodeToolInfo(
+          cls=EdgarTool,
+          description="Search SEC EDGAR database for company filings and financial information",
+          in_code_tool_id=EdgarTool.__name__,
+          display_name=EdgarTool._DISPLAY_NAME,
+      ),
+  ]
+```
+
+  Option 3: MCP Bridge Service (Most Flexible)
+
+  Create a dedicated bridge service that translates between Onyx's HTTP API expectations and your MCP server:
+
+```
+  # mcp_bridge.py
+  from fastapi import FastAPI
+  from mcp import ClientSession
+  import asyncio
+  import json
+
+  class MCPBridge:
+      def __init__(self, mcp_server_params):
+          self.server_params = mcp_server_params
+
+      async def query_mcp_server(self, method: str, params: dict = None):
+          """Generic MCP server query method"""
+          async with ClientSession(self.server_params) as session:
+              # Initialize MCP session
+              await session.initialize()
+
+              # Call the MCP method
+              result = await session.call_tool(method, params or {})
+              return result
+
+      async def search_edgar(self, query: str, **kwargs):
+          return await self.query_mcp_server("search_filings", {
+              "query": query,
+              **kwargs
+          })
+
+      async def get_filing(self, cik: str, **kwargs):
+          return await self.query_mcp_server("get_filing", {
+              "cik": cik,
+              **kwargs
+          })
+
+  # FastAPI wrapper
+  app = FastAPI()
+  bridge = MCPBridge(your_mcp_server_params)
+
+  @app.post("/edgar/search")
+  async def search_endpoint(request: dict):
+      return await bridge.search_edgar(**request)
+```
+
+  Integration Benefits
+
+  Once integrated, your EDGAR MCP server will enable Onyx to:
+
+  1. Answer financial questions with real SEC filing data
+  2. Perform comparative analysis across multiple companies
+  3. Track regulatory changes and compliance updates
+  4. Generate reports combining EDGAR data with internal documents
+  5. Agent workflows can automatically pull financial context for complex queries
+
+  Performance Considerations
+
+  - Caching: Consider caching frequent EDGAR queries in Redis
+  - Rate limiting: SEC EDGAR has rate limits - implement proper throttling
+  - Data size: Large filings may need streaming or pagination
+  - Cost impact: Agent queries using EDGAR data will consume more tokens
+
+  The Custom Tool approach (Option 1) is recommended as it requires minimal code changes to Onyx and provides immediate integration capability through the admin interface.
